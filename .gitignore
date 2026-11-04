@@ -1,0 +1,17 @@
+node_modules/
+.env
+.env.*
+.git-source
+.local-gpt-subscription-bridge/
+tokens*.json
+auth.json
+account.json
+settings.json
+identity.json
+jobs/
+jobs.json
+*.log
+*.tmp
+gpt-bridge-update-*/
+zip-temp/
+__pycache__/
