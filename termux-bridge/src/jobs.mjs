@@ -5,6 +5,8 @@ import {API,SubscriptionAuth,BridgeError,check,sha,readJSON,writeJSON} from './a
 const {version}=JSON.parse(await fs.readFile(new URL('../package.json',import.meta.url),'utf8'));
 
 export const DEFAULT_SETTINGS={paused:false,max_chars:240000,max_calls_5h:20,max_calls_7d:200};
+const RESULT_FIELDS=['request_id','status','created_at','started_at','finished_at','attempts','chars','error_code','message','text','partial_text','usage','fingerprint','client','model','effort'];
+const RESULT_AGE=86400000,USAGE_AGE=604800000,RESULT_LIMIT=50;
 export function bridgePlatform(platform=process.platform,env=process.env){
   if(platform==='android'||env?.TERMUX_VERSION)return 'android';
   if(platform==='darwin')return 'mac';
@@ -74,24 +76,52 @@ export async function readCompleted(body){
 }
 
 export class JobBridge {
-  constructor(dir,options={}){this.dir=dir;this.auth=new SubscriptionAuth(dir,options);this.now=options.clock||Date.now;this.jobs=new Map();this.running=false;this.closed=false;this.changes=Promise.resolve();}
+  constructor(dir,options={}){this.dir=dir;this.auth=new SubscriptionAuth(dir,options);this.now=options.clock||Date.now;this.jobs=new Map();this.running=false;this.closed=false;this.changes=Promise.resolve();this.saves=Promise.resolve();this.finished=new Map();this.usage=new Map();}
   async init(){
     await this.auth.init();await fs.mkdir(path.join(this.dir,'jobs'),{recursive:true,mode:0o700});
     const saved=await readJSON(path.join(this.dir,'settings.json'),{});
     this.settings=Object.fromEntries(Object.keys(DEFAULT_SETTINGS).map(key=>[key,Object.hasOwn(saved,key)?saved[key]:DEFAULT_SETTINGS[key]]));
+    const retained=await readJSON(path.join(this.dir,'completed-jobs.json'),{jobs:[],usage:[]});
+    for(const job of retained.jobs||[])if(['completed','error'].includes(job.status)&&typeof job.fingerprint==='string')this.finished.set(job.request_id,this.terminalJob(job));
+    for(const row of retained.usage||[])if(typeof row.id==='string'&&Number.isFinite(row.at))this.usage.set(row.id,row.at);
+    const migrated=[];
     for(const file of await fs.readdir(path.join(this.dir,'jobs'))){
       if(!/^[a-f0-9]{64}\.json$/.test(file))continue;
+      const info=await fs.lstat(path.join(this.dir,'jobs',file));if(!info.isFile()||info.isSymbolicLink())continue;
       const job=await readJSON(path.join(this.dir,'jobs',file),null);if(!job)continue;
       check(file===sha(job.request_id)+'.json','JOB_FILE','작업 기록이 손상되었습니다. 기존 파일을 보존합니다.');
-      if(['running','queued'].includes(job.status)){job.status='error';job.error_code='INTERRUPTED';job.message='서버가 종료됐던 작업입니다. 자동으로 다시 보내지 않았습니다.';await this.save(job);}
-      this.jobs.set(job.request_id,job);
+      if(Number.isFinite(job.started_at))this.usage.set(job.request_id,job.started_at);
+      if(['completed','error'].includes(job.status))this.finished.set(job.request_id,this.terminalJob(job));
+      migrated.push(file);
     }
+    await this.persistResults();
+    for(const job of this.finished.values())this.jobs.set(job.request_id,job);
+    // Remove legacy body-bearing files only after the body-free snapshot is durable.
+    for(const file of migrated)await fs.unlink(path.join(this.dir,'jobs',file));
     return this;
   }
-  save(job){return writeJSON(path.join(this.dir,'jobs',sha(job.request_id)+'.json'),job);}
-  publicJob(job){const {body,fingerprint,...publicFields}=job;return publicFields;}
-  counts(){const times=[...this.jobs.values()].map(j=>j.started_at).filter(Number.isFinite);return {five_hours:times.filter(t=>t>this.now()-18000000).length,seven_days:times.filter(t=>t>this.now()-604800000).length};}
-  status(){return {version,platform:bridgePlatform(),connected:!!this.auth.tokens,running:this.running,settings:this.settings,calls:this.counts(),recent:[...this.jobs.values()].sort((a,b)=>b.created_at-a.created_at).slice(0,20).map(j=>({request_id:j.request_id,status:j.status,created_at:j.created_at,started_at:j.started_at||null,finished_at:j.finished_at||null,error_code:j.error_code||'',model:j.body?.model||'',effort:j.body?.reasoning?.effort||'',usage:j.usage||null,client:j.client||null}))};}
+  terminalJob(job){
+    const source={...job,model:job.body?.model??job.model,effort:job.body?.reasoning?.effort??job.effort,finished_at:job.finished_at??job.created_at};
+    return Object.fromEntries(RESULT_FIELDS.filter(key=>source[key]!==undefined).map(key=>[key,source[key]]));
+  }
+  async persistResults(){
+    const now=this.now();
+    const recent=[...this.finished.values()].filter(job=>Number.isFinite(job.finished_at)&&now-job.finished_at<=RESULT_AGE).sort((a,b)=>b.finished_at-a.finished_at).slice(0,RESULT_LIMIT);
+    this.finished=new Map(recent.map(job=>[job.request_id,job]));
+    for(const [id,at] of this.usage)if(now-at>USAGE_AGE)this.usage.delete(id);
+    await writeJSON(path.join(this.dir,'completed-jobs.json'),{jobs:recent,usage:[...this.usage].map(([id,at])=>({id,at}))});
+  }
+  save(job){
+    const write=async()=>{
+      if(Number.isFinite(job.started_at))this.usage.set(job.request_id,job.started_at);
+      if(['completed','error'].includes(job.status))this.finished.set(job.request_id,this.terminalJob(job));
+      await this.persistResults();
+    };
+    const saved=this.saves.then(write);this.saves=saved.catch(()=>{});return saved;
+  }
+  publicJob(job){const {body,...publicFields}=job;return publicFields;}
+  counts(){const times=[...this.usage.values()];return {five_hours:times.filter(t=>t>this.now()-18000000).length,seven_days:times.filter(t=>t>this.now()-604800000).length};}
+  status(){return {version,platform:bridgePlatform(),connected:!!this.auth.tokens,running:this.running,settings:this.settings,calls:this.counts(),recent:[...this.jobs.values()].sort((a,b)=>b.created_at-a.created_at).slice(0,20).map(j=>({request_id:j.request_id,status:j.status,created_at:j.created_at,started_at:j.started_at||null,finished_at:j.finished_at||null,error_code:j.error_code||'',fingerprint:j.fingerprint,model:j.body?.model||j.model||'',effort:j.body?.reasoning?.effort||j.effort||'',usage:j.usage||null,client:j.client||null}))};}
   async settingsChange(value){
     check(value&&typeof value==='object'&&!Array.isArray(value)&&Object.keys(value).every(k=>Object.hasOwn(DEFAULT_SETTINGS,k)),'SETTINGS','설정 항목을 확인해 주세요.');
     const next={...this.settings,...value};
@@ -133,7 +163,7 @@ export class JobBridge {
             const result=await readCompleted(response.body);job.status='completed';job.text=result.text;job.usage=result.usage;job.finished_at=this.now();
           }finally{clearTimeout(timeout);this.controller=null;}
         }catch(error){
-          job.status='error';job.error_code=error instanceof BridgeError?error.code:'CONNECTION_UNCERTAIN';
+          job.status='error';job.finished_at=this.now();job.error_code=error instanceof BridgeError?error.code:'CONNECTION_UNCERTAIN';
           job.message=error instanceof BridgeError?error.message:'연결 결과가 불확실합니다. 자동 재요청하지 않았습니다.';
           if(error.partial_text)job.partial_text=error.partial_text;
           if(/usage_limit|usage_unavailable|429|PLAN_PERMISSION|LOGIN_REQUIRED|invalid_grant/.test(job.error_code))await this.settingsChange({paused:true});
